@@ -1,0 +1,177 @@
+name: Windows.EventLogs.ResetNightmare
+author: "@alexsta2019"
+
+description: |
+  Detects ResetNightmare (CVE-2026-27912) and the wider noPac / UPN
+  manipulation family of Active Directory attacks by correlating account
+  manipulation, Kerberos and password reset events from the Domain
+  Controller Security log.
+
+  ## Background
+
+  ResetNightmare abuses a validation flaw in the Kerberos Change Password
+  (`kadmin/changepw`) protocol to reset the password of an arbitrary user
+  or computer account without knowing its current credentials. The typical
+  kill chain is:
+
+    1. The attacker sets the `userPrincipalName` (UPN) of an account they
+       control to the bare `sAMAccountName` of the target account (e.g.
+       `Administrator` or `DC01`). Because a legitimate UPN is a
+       fully-qualified `user@domain` value, a UPN with **no `@` suffix** is
+       highly anomalous and is the primary signal used here.
+    2. A TGT is requested for that account using the `NT-ENTERPRISE`
+       principal name type, which resolves to the spoofed target.
+    3. The target account's password is reset over `kadmin/changepw`.
+
+  ## Detection logic
+
+  This artifact parses the Security event log once and:
+
+    * Flags EID 4738 (user changed) / 4742 (computer changed) events where
+      `userPrincipalName` was set to a value that does **not** contain `@`
+      (i.e. set to a raw sAMAccountName rather than a real UPN).
+    * Correlates each suspicious UPN change with any password reset
+      (EID 4723 / 4724) for the spoofed identity and any TGT request
+      (EID 4768) occurring on the same host within `CorrelationWindowMinutes`.
+
+  Rows where a UPN manipulation is followed by a matching password reset
+  are rated **HIGH** (full kill chain observed). A UPN manipulation on its
+  own is rated **MEDIUM** and should be triaged.
+
+  ## Notes / false positives
+
+  Some environments legitimately populate `userPrincipalName` with a bare
+  value (rare). Use `UPNWhitelistRegex` to suppress known-good accounts.
+  Requires the DC Security log with account management and Kerberos
+  auditing enabled (Audit User Account Management, Audit Computer Account
+  Management, Audit Kerberos Authentication Service).
+
+  Log Source: Windows Security Event Log (Domain Controllers).
+  Event IDs: 4738, 4742 (UPN change), 4723, 4724 (password reset),
+  4768 (TGT request), 4781 (name change - contextual).
+
+reference:
+  - https://github.com/semperis-community/resetnightmare
+  - https://attack.mitre.org/techniques/T1098/    # Account Manipulation
+  - https://attack.mitre.org/techniques/T1558/    # Steal or Forge Kerberos Tickets
+  - https://www.thehacker.recipes/ad/movement/kerberos/samaccountname-spoofing
+
+parameters:
+  - name: EvtxGlob
+    default: '%SystemRoot%\System32\winevt\logs\Security.evtx'
+
+  - name: CorrelationWindowMinutes
+    type: int
+    default: 10
+    description: |
+      Time window (minutes) after a suspicious UPN change in which a
+      password reset or TGT request is treated as part of the same
+      kill chain.
+
+  - name: UPNWhitelistRegex
+    default: "^$"
+    type: regex
+    description: |
+      Regex of userPrincipalName values that are known-good and should be
+      suppressed. Defaults to matching nothing.
+
+  - name: VSSAnalysisAge
+    type: int
+    default: 0
+    description: |
+      If larger than zero we analyze VSS within this many days ago. (e.g 7
+      will analyze all VSS within the last week). Note that when using VSS
+      analysis we have to use the ntfs accessor for everything which will be
+      much slower.
+
+sources:
+  - query: |
+      LET VSS_MAX_AGE_DAYS <= VSSAnalysisAge
+      LET Accessor = if(condition=VSSAnalysisAge > 0, then="ntfs_vss", else="auto")
+
+      -- Expand the provided glob into a list of paths on the file system.
+      LET fspaths = SELECT OSPath
+        FROM glob(globs=expand(path=EvtxGlob))
+
+      -- Pull every account-manipulation / kerberos / reset event a single
+      -- time per evtx file so we only parse each log once.
+      LET all_events = SELECT * FROM foreach(row=fspaths, query={
+          SELECT
+              timestamp(epoch=int(int=System.TimeCreated.SystemTime)) AS EventTime,
+              System.EventID.Value AS EventID,
+              System.Computer AS Computer,
+              EventData.SubjectUserName AS SubjectUserName,
+              EventData.SubjectUserSid AS SubjectUserSid,
+              EventData.TargetUserName AS TargetUserName,
+              EventData.TargetSid AS TargetSid,
+              EventData.UserPrincipalName AS UserPrincipalName,
+              EventData.OldTargetUserName AS OldTargetUserName,
+              EventData.NewTargetUserName AS NewTargetUserName,
+              OSPath
+          FROM parse_evtx(filename=OSPath, accessor=Accessor)
+          WHERE System.EventID.Value IN (4738, 4742, 4781, 4768, 4723, 4724)
+      })
+
+      -- Password reset attempts (4723 = self change, 4724 = reset by another).
+      LET resets = SELECT EventTime, Computer, SubjectUserName, TargetUserName, EventID
+        FROM all_events
+        WHERE EventID IN (4723, 4724)
+
+      -- TGT requests, used as supporting context for the kill chain.
+      LET tgts = SELECT EventTime, Computer, TargetUserName, TargetSid
+        FROM all_events
+        WHERE EventID = 4768
+
+      -- Primary IOC: a userPrincipalName set to a value with no "@" suffix,
+      -- i.e. a bare sAMAccountName rather than a legitimate UPN. Columns are
+      -- renamed to avoid collisions inside the correlation subqueries below.
+      LET upn_manip = SELECT
+              EventTime AS ManipTime,
+              EventID AS ManipEventID,
+              Computer AS ManipComputer,
+              SubjectUserName AS ChangedBy,
+              TargetUserName AS ControlledAccount,
+              UserPrincipalName AS SpoofedUPN,
+              OSPath AS ManipPath
+        FROM all_events
+        WHERE EventID IN (4738, 4742)
+            AND UserPrincipalName
+            AND NOT UserPrincipalName IN ("-", "%%1793")
+            AND NOT UserPrincipalName =~ "@"
+            AND NOT UserPrincipalName =~ UPNWhitelistRegex
+
+      -- Correlate each suspicious UPN change with resets / TGTs for the
+      -- spoofed identity on the same host inside the configured window.
+      LET correlated = SELECT
+              ManipTime, ManipEventID, ManipComputer, ChangedBy,
+              ControlledAccount, SpoofedUPN, ManipPath,
+              { SELECT EventTime AS ResetTime, EventID AS ResetEventID,
+                       SubjectUserName AS ResetBy, TargetUserName AS ResetTarget
+                FROM resets
+                WHERE Computer = ManipComputer
+                    AND lowercase(string=TargetUserName) =~ ("^" + lowercase(string=SpoofedUPN) + "\\$?$")
+                    AND EventTime >= ManipTime
+                    AND EventTime <= timestamp(epoch=ManipTime.Unix + CorrelationWindowMinutes * 60)
+              } AS RelatedResets,
+              { SELECT EventTime AS TGTTime, TargetUserName AS TGTTarget, TargetSid AS TGTSid
+                FROM tgts
+                WHERE Computer = ManipComputer
+                    AND EventTime >= ManipTime
+                    AND EventTime <= timestamp(epoch=ManipTime.Unix + CorrelationWindowMinutes * 60)
+              } AS RelatedTGTs
+        FROM upn_manip
+
+      SELECT
+          ManipTime AS EventTime,
+          ManipEventID AS EventID,
+          ManipComputer AS Computer,
+          ChangedBy,
+          ControlledAccount,
+          SpoofedUPN,
+          RelatedResets,
+          RelatedTGTs,
+          if(condition=len(list=RelatedResets) > 0,
+             then="HIGH - UPN manipulation followed by password reset (ResetNightmare kill chain)",
+             else="MEDIUM - Suspicious UPN manipulation (bare sAMAccountName, no domain suffix)") AS Detection,
+          ManipPath AS OSPath
+      FROM correlated
